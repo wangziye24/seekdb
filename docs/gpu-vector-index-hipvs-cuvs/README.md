@@ -126,12 +126,22 @@ validation comment rather than in the source tree.
 The no-GPU DDL contract remains covered by
 [`vector_index_cuvs_ddl.test`](../../tools/deploy/mysql_test/test_suite/vector_index/t/vector_index_cuvs_ddl.test).
 
+## GPU snapshot persistence
+
+A `lib=cuvs` index persists a **GPU snapshot** of the CAGRA graph so that a
+restart reloads the graph instead of building it again. The write path is on the
+build critical path (`CREATE VECTOR INDEX` -> first query), so it only moves the
+kNN graph device->host through pinned staging and stores the vectors the adaptor
+already holds in host memory; a reload rebuilds the index from `(graph, vectors)`
+with `cuvsCagraIndexFromArgs` and does not re-run graph construction. Format and
+transfer details are in
+[`snapshot-persistence.md`](snapshot-persistence.md); the GPU regression is
+[`validation/run_ddl_persistence_smoke.sh`](validation/run_ddl_persistence_smoke.sh).
+
 ## Current limitations
 
 - Phase 1 supports dense float32 L2 indexes only.
-- GPU indexes are process-local and rebuilt lazily; persistence and cache reuse
-  are follow-up work.
 - The explicit batch API rebuilds its CAGRA index per call.
 - GPU validation is manual because upstream CI has no compatible GPU runner.
-- Multi-GPU, long-duration, and snapshot-reload coverage are out of scope for
-  this phase.
+- Multi-GPU and long-duration coverage are out of scope for this phase. Snapshot
+  reload is covered by the DDL persistence smoke runner.
