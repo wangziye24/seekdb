@@ -1,4 +1,26 @@
-/* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here. */
+/* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here.
+ *
+ * Contest task (AMD GPU CAGRA index build): the baseline builds the CAGRA graph
+ * on the GPU and persists a "GPU snapshot" of it.  The snapshot is on the build
+ * critical path (CREATE VECTOR INDEX ... -> first query), so the bridge exposes
+ * exactly the three pieces the seekdb adaptor needs to persist it with one pass
+ * of large block transfers:
+ *
+ *   - seekdb_cuvs_build: upload the dataset once through pinned host staging and
+ *     let the CAGRA index keep a device reference to it.  cuVS does not copy a
+ *     device dataset again, and pinned + one big H2D beats the pageable copy of
+ *     a host dataset.
+ *   - seekdb_cuvs_graph_bytes / seekdb_cuvs_export_graph: copy only the kNN
+ *     graph device->host through pinned staging.  The vectors are already on the
+ *     host when the snapshot is written, so they never have to make a round trip
+ *     through the GPU or through a temporary CAGRA file.
+ *   - seekdb_cuvs_build_from_graph: rebuild the index from (graph, dataset) with
+ *     cuvsCagraIndexFromArgs -- the expensive graph construction is not re-run,
+ *     the graph and the vectors are uploaded straight into device buffers.
+ *
+ * The CAGRA build parameters stay at the values the baseline compares against,
+ * so recall is unchanged.
+ */
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
@@ -10,42 +32,163 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
   cuvsResources_t        res;
   cuvsCagraIndexParams_t ip;
   cuvsCagraIndex_t       idx;
   long n, dim;
+  /* Device buffers the index keeps a non-owning reference to. */
+  void*  dev_dataset;
+  size_t dev_dataset_bytes;
+  void*  dev_graph;
+  size_t dev_graph_bytes;
 } sk_cuvs_index;
+
+static void sk_fill_tensor(DLManagedTensor* t, void* data, int device_type, int dtype_code,
+                           int bits, long* shape, int ndim)
+{
+  t->dl_tensor.data = data;
+  t->dl_tensor.device.device_type = (DLDeviceType)device_type;
+  t->dl_tensor.device.device_id = 0;
+  t->dl_tensor.ndim = ndim;
+  t->dl_tensor.dtype.code = (DLDataTypeCode)dtype_code;
+  t->dl_tensor.dtype.bits = (unsigned char)bits;
+  t->dl_tensor.dtype.lanes = 1;
+  t->dl_tensor.shape = (int64_t*)shape;
+  t->dl_tensor.strides = NULL;
+  t->dl_tensor.byte_offset = 0;
+  t->manager_ctx = NULL;
+  t->deleter = NULL;
+}
+
+/* Same CAGRA parameters the frozen baseline uses (they define the recall). */
+static void sk_init_index_params(cuvsCagraIndexParams_t ip)
+{
+  ip->build_algo = NN_DESCENT;
+  ip->graph_degree = 128;
+  ip->intermediate_graph_degree = 256;
+  ip->nn_descent_niter = 100;
+}
+
+/* Host -> device through one pinned staging buffer; falls back to a plain copy. */
+static int sk_upload(cuvsResources_t res, void* dst, const void* src, size_t bytes)
+{
+  int rc = 0;
+  (void)res;
+  if (dst == NULL || src == NULL || bytes == 0) { return -1; }
+  {
+    void* pinned = NULL;
+    if (cudaMallocHost(&pinned, bytes) == cudaSuccess && pinned != NULL) {
+      memcpy(pinned, src, bytes);
+      if (cudaMemcpy(dst, pinned, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = -2; }
+      cudaFreeHost(pinned);
+    } else if (cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+      rc = -3;
+    }
+  }
+  if (rc != 0) {
+    fprintf(stderr, "[seekdb_cuvs] H2D copy of %zu bytes failed: %s\n",
+            bytes, cudaGetErrorString(cudaGetLastError()));
+  }
+  return rc;
+}
+
+/* Device -> host through one pinned staging buffer; falls back to a plain copy. */
+static int sk_download(void* dst, const void* src, size_t bytes)
+{
+  int rc = 0;
+  if (dst == NULL || src == NULL || bytes == 0) { return -1; }
+  {
+    void* pinned = NULL;
+    if (cudaMallocHost(&pinned, bytes) == cudaSuccess && pinned != NULL) {
+      if (cudaMemcpy(pinned, src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { rc = -2; }
+      else { memcpy(dst, pinned, bytes); }
+      cudaFreeHost(pinned);
+    } else if (cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+      rc = -3;
+    }
+  }
+  if (rc != 0) {
+    fprintf(stderr, "[seekdb_cuvs] D2H copy of %zu bytes failed: %s\n",
+            bytes, cudaGetErrorString(cudaGetLastError()));
+  }
+  return rc;
+}
+
+static void sk_free_index(sk_cuvs_index* h)
+{
+  if (h == NULL) { return; }
+  if (h->idx != NULL) { cuvsCagraIndexDestroy(h->idx); h->idx = NULL; }
+  if (h->dev_dataset != NULL) {
+    cuvsRMMFree(h->res, h->dev_dataset, h->dev_dataset_bytes);
+    h->dev_dataset = NULL; h->dev_dataset_bytes = 0;
+  }
+  if (h->dev_graph != NULL) {
+    cuvsRMMFree(h->res, h->dev_graph, h->dev_graph_bytes);
+    h->dev_graph = NULL; h->dev_graph_bytes = 0;
+  }
+  if (h->ip != NULL) { cuvsCagraIndexParamsDestroy(h->ip); h->ip = NULL; }
+  if (h->res != 0) { cuvsResourcesDestroy(h->res); h->res = 0; }
+  free(h);
+}
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
-  sk_cuvs_index* h = (sk_cuvs_index*)calloc(1, sizeof(*h));
-  if (!h) return NULL;
+  sk_cuvs_index* h = NULL;
+  size_t bytes = 0;
+  long shape[2];
+  DLManagedTensor dset;
+  int built = 0;
+  if (base == NULL || n <= 0 || dim <= 0) { return NULL; }
+  bytes = (size_t)n * (size_t)dim * sizeof(float);
+  h = (sk_cuvs_index*)calloc(1, sizeof(*h));
+  if (h == NULL) { return NULL; }
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
+  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) { sk_free_index(h); return NULL; }
+  sk_init_index_params(h->ip);
+  if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) {
+    sk_free_index(h);
+    fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
+    return NULL;
+  }
 
-  DLManagedTensor dset; long ds[2] = {n, dim};
-  dset.dl_tensor.data = (void*)base;
-  dset.dl_tensor.device.device_type = kDLCPU; dset.dl_tensor.device.device_id = 0;
-  dset.dl_tensor.ndim = 2;
-  dset.dl_tensor.dtype.code = kDLFloat; dset.dl_tensor.dtype.bits = 32; dset.dl_tensor.dtype.lanes = 1;
-  dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
-
-  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
-  h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
-  if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
-  h->n = n; h->dim = dim;
+  /* Fast path: one pinned upload, then the index references that device copy.
+   * The host-dataset path below keeps the old behaviour if pinned staging or the
+   * RMM allocation is unavailable. */
+  if (cuvsRMMAlloc(h->res, &h->dev_dataset, bytes) == CUVS_SUCCESS) {
+    h->dev_dataset_bytes = bytes;
+    if (sk_upload(h->res, h->dev_dataset, base, bytes) == 0) {
+      shape[0] = n; shape[1] = dim;
+      sk_fill_tensor(&dset, h->dev_dataset, kDLCUDA, kDLFloat, 32, shape, 2);
+      if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) == CUVS_SUCCESS) { built = 1; }
+    }
+    if (!built) {
+      cuvsRMMFree(h->res, h->dev_dataset, h->dev_dataset_bytes);
+      h->dev_dataset = NULL;
+      h->dev_dataset_bytes = 0;
+      cuvsCagraIndexDestroy(h->idx);
+      h->idx = NULL;
+      if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) {
+        sk_free_index(h);
+        fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
+        return NULL;
+      }
+    }
+  }
+  if (!built) {
+    shape[0] = n; shape[1] = dim;
+    sk_fill_tensor(&dset, (void*)base, kDLCPU, kDLFloat, 32, shape, 2);
+    if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) {
+      fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
+      sk_free_index(h);
+      return NULL;
+    }
+  }
+  h->n = n;
+  h->dim = dim;
   return h;
-
-fail_idx: cuvsCagraIndexDestroy(h->idx);
-fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
-fail_res: cuvsResourcesDestroy(h->res); free(h);
-  fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
-  return NULL;
 }
 
 int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
@@ -61,11 +204,9 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   if (cudaMemcpy(qd, query, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
   {
     DLManagedTensor qt, nt, dt; long qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};
-    qt.dl_tensor.data=qd; qt.dl_tensor.device.device_type=kDLCUDA; qt.dl_tensor.device.device_id=0;
-    qt.dl_tensor.ndim=2; qt.dl_tensor.dtype.code=kDLFloat; qt.dl_tensor.dtype.bits=32; qt.dl_tensor.dtype.lanes=1;
-    qt.dl_tensor.shape=qs; qt.dl_tensor.strides=0; qt.dl_tensor.byte_offset=0;
-    nt=qt; nt.dl_tensor.data=nd; nt.dl_tensor.dtype.code=kDLUInt; nt.dl_tensor.shape=nsh;
-    dt=qt; dt.dl_tensor.data=dd; dt.dl_tensor.dtype.code=kDLFloat; dt.dl_tensor.shape=dsh;
+    sk_fill_tensor(&qt, qd, kDLCUDA, kDLFloat, 32, qs, 2);
+    sk_fill_tensor(&nt, nd, kDLCUDA, kDLUInt, 32, nsh, 2);
+    sk_fill_tensor(&dt, dd, kDLCUDA, kDLFloat, 32, dsh, 2);
     if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
     {
       size_t required_itopk = (size_t)topk * 4;
@@ -89,58 +230,110 @@ done:
 
 void seekdb_cuvs_free(void* handle)
 {
-  sk_cuvs_index* h = (sk_cuvs_index*)handle;
-  if (!h) return;
-  cuvsCagraIndexDestroy(h->idx);
-  cuvsCagraIndexParamsDestroy(h->ip);
-  cuvsResourcesDestroy(h->res);
-  free(h);
+  sk_free_index((sk_cuvs_index*)handle);
 }
 
-int seekdb_cuvs_serialize(void* handle, const char* filename)
+/* Fills *graph with the index's device graph view (row-major [n, degree]).
+ * The view carries a heap-allocated shape array: call graph->deleter(graph). */
+static int sk_graph_view(sk_cuvs_index* h, DLManagedTensor* graph, long* rows, long* degree)
 {
-  sk_cuvs_index* index = (sk_cuvs_index*)handle;
-  if (!index || !filename) return 1;
-  if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
-    fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
-    return 1;
+  if (h == NULL || graph == NULL || rows == NULL || degree == NULL) { return -1; }
+  memset(graph, 0, sizeof(*graph));
+  if (cuvsCagraIndexGetGraph(h->idx, graph) != CUVS_SUCCESS) {
+    fprintf(stderr, "[seekdb_cuvs] cannot get the CAGRA graph: %s\n", cuvsGetLastErrorText());
+    return -2;
+  }
+  if (graph->dl_tensor.ndim != 2 || graph->dl_tensor.shape == NULL ||
+      graph->dl_tensor.data == NULL) {
+    if (graph->deleter != NULL) { graph->deleter(graph); }
+    return -3;
+  }
+  *rows = (long)graph->dl_tensor.shape[0];
+  *degree = (long)graph->dl_tensor.shape[1];
+  if (*rows <= 0 || *degree <= 0) {
+    if (graph->deleter != NULL) { graph->deleter(graph); }
+    return -4;
   }
   return 0;
 }
 
-void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
+long seekdb_cuvs_graph_bytes(void* handle)
 {
-  if (!filename || n <= 0 || dim <= 0) return NULL;
-  sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
-  if (!index) return NULL;
-  if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
-  if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
-  if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraDeserialize(index->res, filename, index->idx) != CUVS_SUCCESS) goto fail_idx;
-  {
-    int64_t actual_n = 0;
-    int64_t actual_dim = 0;
-    if (cuvsCagraIndexGetSize(index->idx, &actual_n) != CUVS_SUCCESS ||
-        cuvsCagraIndexGetDims(index->idx, &actual_dim) != CUVS_SUCCESS ||
-        actual_n != n || actual_dim != dim) {
-      fprintf(stderr, "[seekdb_cuvs] snapshot shape mismatch: %ld x %ld, expected %ld x %ld\n",
-              (long)actual_n, (long)actual_dim, n, dim);
-      goto fail_idx;
-    }
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  DLManagedTensor graph;
+  long rows = 0, degree = 0;
+  if (sk_graph_view(h, &graph, &rows, &degree) != 0) { return -1; }
+  if (graph.deleter != NULL) { graph.deleter(&graph); }
+  return rows * degree * (long)sizeof(unsigned int);
+}
+
+int seekdb_cuvs_export_graph(void* handle, void* host_out, long capacity)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  DLManagedTensor graph;
+  long rows = 0, degree = 0;
+  size_t bytes = 0;
+  int rc = 0;
+  if (host_out == NULL || capacity <= 0) { return -1; }
+  if (sk_graph_view(h, &graph, &rows, &degree) != 0) { return -2; }
+  bytes = (size_t)rows * (size_t)degree * sizeof(unsigned int);
+  if ((size_t)capacity < bytes) {
+    if (graph.deleter != NULL) { graph.deleter(&graph); }
+    return -3;
   }
-  index->n = n;
-  index->dim = dim;
-  return index;
-fail_idx:
-  cuvsCagraIndexDestroy(index->idx);
-fail_ip:
-  cuvsCagraIndexParamsDestroy(index->ip);
-fail_res:
-  cuvsResourcesDestroy(index->res);
-fail:
-  fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
-  free(index);
-  return NULL;
+  rc = sk_download(host_out, graph.dl_tensor.data, bytes);
+  if (graph.deleter != NULL) { graph.deleter(&graph); }
+  return rc == 0 ? 0 : -4;
+}
+
+void* seekdb_cuvs_build_from_graph(const float* vectors, long n, long dim,
+                                   const unsigned int* graph, long graph_degree)
+{
+  sk_cuvs_index* h = NULL;
+  size_t vbytes = 0, gbytes = 0;
+  long dshape[2], gshape[2];
+  DLManagedTensor dset, dgraph;
+  int64_t actual_n = 0, actual_dim = 0;
+  if (vectors == NULL || graph == NULL || n <= 0 || dim <= 0 || graph_degree <= 0) {
+    return NULL;
+  }
+  vbytes = (size_t)n * (size_t)dim * sizeof(float);
+  gbytes = (size_t)n * (size_t)graph_degree * sizeof(unsigned int);
+  h = (sk_cuvs_index*)calloc(1, sizeof(*h));
+  if (h == NULL) { return NULL; }
+  if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
+  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) { sk_free_index(h); return NULL; }
+  sk_init_index_params(h->ip);
+  if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) { sk_free_index(h); return NULL; }
+
+  if (cuvsRMMAlloc(h->res, &h->dev_dataset, vbytes) != CUVS_SUCCESS) { sk_free_index(h); return NULL; }
+  h->dev_dataset_bytes = vbytes;
+  if (cuvsRMMAlloc(h->res, &h->dev_graph, gbytes) != CUVS_SUCCESS) { sk_free_index(h); return NULL; }
+  h->dev_graph_bytes = gbytes;
+  if (sk_upload(h->res, h->dev_dataset, vectors, vbytes) != 0 ||
+      sk_upload(h->res, h->dev_graph, graph, gbytes) != 0) {
+    sk_free_index(h);
+    return NULL;
+  }
+  dshape[0] = n; dshape[1] = dim;
+  gshape[0] = n; gshape[1] = graph_degree;
+  sk_fill_tensor(&dset, h->dev_dataset, kDLCUDA, kDLFloat, 32, dshape, 2);
+  sk_fill_tensor(&dgraph, h->dev_graph, kDLCUDA, kDLUInt, 32, gshape, 2);
+  /* The index only stores references to the two device buffers above; they are
+   * owned (and freed) by this handle. */
+  if (cuvsCagraIndexFromArgs(h->res, L2Expanded, &dgraph, &dset, h->idx) != CUVS_SUCCESS ||
+      cuvsCagraIndexGetSize(h->idx, &actual_n) != CUVS_SUCCESS ||
+      cuvsCagraIndexGetDims(h->idx, &actual_dim) != CUVS_SUCCESS ||
+      actual_n != (int64_t)n || actual_dim != (int64_t)dim) {
+    fprintf(stderr, "[seekdb_cuvs] cannot rebuild the CAGRA index from the graph: "
+            "%s (got %ld x %ld, expected %ld x %ld)\n",
+            cuvsGetLastErrorText(), (long)actual_n, (long)actual_dim, n, dim);
+    sk_free_index(h);
+    return NULL;
+  }
+  h->n = n;
+  h->dim = dim;
+  return h;
 }
 
 int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,
