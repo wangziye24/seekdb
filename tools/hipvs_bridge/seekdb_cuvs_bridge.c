@@ -72,18 +72,32 @@ static void sk_init_index_params(cuvsCagraIndexParams_t ip)
   ip->nn_descent_niter = 100;
 }
 
+/* Pinned staging comes from cuVS's own host allocator (two-argument C API, so
+ * no HIP flag-argument differences); callers fall back to plain copies when the
+ * allocation is unavailable. */
+static void* sk_pinned_alloc(size_t bytes)
+{
+  void* ptr = NULL;
+  if (bytes == 0 || cuvsRMMHostAlloc(&ptr, bytes) != CUVS_SUCCESS) { return NULL; }
+  return ptr;
+}
+
+static void sk_pinned_free(void* ptr, size_t bytes)
+{
+  if (ptr != NULL) { cuvsRMMHostFree(ptr, bytes); }
+}
+
 /* Host -> device through one pinned staging buffer; falls back to a plain copy. */
-static int sk_upload(cuvsResources_t res, void* dst, const void* src, size_t bytes)
+static int sk_upload(void* dst, const void* src, size_t bytes)
 {
   int rc = 0;
-  (void)res;
   if (dst == NULL || src == NULL || bytes == 0) { return -1; }
   {
-    void* pinned = NULL;
-    if (cudaMallocHost(&pinned, bytes) == cudaSuccess && pinned != NULL) {
+    void* pinned = sk_pinned_alloc(bytes);
+    if (pinned != NULL) {
       memcpy(pinned, src, bytes);
       if (cudaMemcpy(dst, pinned, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = -2; }
-      cudaFreeHost(pinned);
+      sk_pinned_free(pinned, bytes);
     } else if (cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
       rc = -3;
     }
@@ -101,11 +115,11 @@ static int sk_download(void* dst, const void* src, size_t bytes)
   int rc = 0;
   if (dst == NULL || src == NULL || bytes == 0) { return -1; }
   {
-    void* pinned = NULL;
-    if (cudaMallocHost(&pinned, bytes) == cudaSuccess && pinned != NULL) {
+    void* pinned = sk_pinned_alloc(bytes);
+    if (pinned != NULL) {
       if (cudaMemcpy(pinned, src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { rc = -2; }
       else { memcpy(dst, pinned, bytes); }
-      cudaFreeHost(pinned);
+      sk_pinned_free(pinned, bytes);
     } else if (cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
       rc = -3;
     }
@@ -159,7 +173,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
    * RMM allocation is unavailable. */
   if (cuvsRMMAlloc(h->res, &h->dev_dataset, bytes) == CUVS_SUCCESS) {
     h->dev_dataset_bytes = bytes;
-    if (sk_upload(h->res, h->dev_dataset, base, bytes) == 0) {
+    if (sk_upload(h->dev_dataset, base, bytes) == 0) {
       shape[0] = n; shape[1] = dim;
       sk_fill_tensor(&dset, h->dev_dataset, kDLCUDA, kDLFloat, 32, shape, 2);
       if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) == CUVS_SUCCESS) { built = 1; }
@@ -310,8 +324,8 @@ void* seekdb_cuvs_build_from_graph(const float* vectors, long n, long dim,
   h->dev_dataset_bytes = vbytes;
   if (cuvsRMMAlloc(h->res, &h->dev_graph, gbytes) != CUVS_SUCCESS) { sk_free_index(h); return NULL; }
   h->dev_graph_bytes = gbytes;
-  if (sk_upload(h->res, h->dev_dataset, vectors, vbytes) != 0 ||
-      sk_upload(h->res, h->dev_graph, graph, gbytes) != 0) {
+  if (sk_upload(h->dev_dataset, vectors, vbytes) != 0 ||
+      sk_upload(h->dev_graph, graph, gbytes) != 0) {
     sk_free_index(h);
     return NULL;
   }

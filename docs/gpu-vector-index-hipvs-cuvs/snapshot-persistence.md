@@ -77,6 +77,8 @@ path.
 
 `tools/hipvs_bridge/seekdb_cuvs_bridge.c`:
 
+- Pinned staging uses cuVS's own host allocator (`cuvsRMMHostAlloc`, a two-argument
+  C API) and falls back to plain pageable copies when it is unavailable.
 - `seekdb_cuvs_build` uploads the dataset once through a pinned staging buffer and
   passes a device `DLManagedTensor` to `cuvsCagraBuild`. The index keeps a
   non-owning reference to that device buffer (cuVS does not copy a device dataset
